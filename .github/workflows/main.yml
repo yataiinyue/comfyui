@@ -1,0 +1,111 @@
+name: 下载文件并保留原始文件名作为产物
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: '需要下载的URL（多个URL用逗号分隔）'
+        required: true
+        default: 'https://example.com/file1.txt,https://example.com/file2.zip'
+      download_dir:
+        description: '下载文件的临时目录（所有文件直接放此目录，无嵌套）'
+        required: false
+        default: './downloaded_files'
+      artifact_name:
+        description: '上传产物的总名称（下载的多个文件会放在此产物包内）'
+        required: true
+        default: 'original-filename-assets'
+      retention_days:
+        description: '产物保留天数'
+        required: false
+        default: 7
+
+jobs:
+  download-with-original-name:
+    runs-on: ubuntu-latest
+    steps:
+      # 可选：检出仓库（无需关联仓库文件可删除）
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 步骤1：创建纯净的下载目录（确保无残留文件）
+      - name: 创建并清空下载目录
+        run: |
+          rm -rf ${{ github.event.inputs.download_dir }}  # 先删除旧目录（防止残留）
+          mkdir -p ${{ github.event.inputs.download_dir }}
+          chmod 755 ${{ github.event.inputs.download_dir }}
+
+      # 步骤2：确保wget可用
+      - name: 安装/验证wget
+        run: |
+          if ! command -v wget &> /dev/null; then
+            sudo apt update && sudo apt install -y wget
+          fi
+
+      # 步骤3：下载文件（强制保留原始文件名，自动处理URL重定向）
+      - name: 下载文件并保留原始名称
+        run: |
+          # 拆分逗号分隔的URL列表，去除首尾空格
+          IFS=',' read -ra URL_LIST <<< "${{ github.event.inputs.download_url }}"
+          
+          # 遍历每个URL执行下载
+          for url in "${URL_LIST[@]}"; do
+            # 清理URL前后空格
+            url_trimmed=$(echo "$url" | xargs)
+            if [ -z "$url_trimmed" ]; then
+              echo "⚠️ 跳过空URL"
+              continue
+            fi
+
+            echo "📥 开始下载: $url_trimmed"
+            
+            # wget核心参数说明：
+            # -P：下载目录
+            # -c：断点续传
+            # -T 60：超时60秒
+            # -nv：精简输出
+            # --no-check-certificate：忽略证书错误
+            # --content-disposition：关键！强制使用服务器返回的原始文件名（处理重定向/动态URL）
+            # --trust-server-names：使用URL最后部分作为文件名（备用方案）
+            wget -P ${{ github.event.inputs.download_dir }} \
+                 -c -T 60 -nv \
+                 --no-check-certificate \
+                 --content-disposition \
+                 --trust-server-names \
+                 "$url_trimmed"
+            
+            # 检查下载结果
+            if [ $? -ne 0 ]; then
+              echo "❌ 下载失败: $url_trimmed"
+              exit 1
+            fi
+            echo "✅ 下载成功: $url_trimmed"
+          done
+
+      # 步骤4：验证下载结果（防止空产物）
+      - name: 检查下载文件数量
+        run: |
+          FILE_COUNT=$(find ${{ github.event.inputs.download_dir }} -type f | wc -l)
+          if [ $FILE_COUNT -eq 0 ]; then
+            echo "❌ 下载目录为空，无文件可上传"
+            exit 1
+          fi
+          echo "✅ 共成功下载 $FILE_COUNT 个文件，文件列表："
+          ls -l ${{ github.event.inputs.download_dir }}  # 打印下载的文件信息（方便排查）
+
+      # 步骤5：上传文件（直接按原始文件名，无打包）
+      - name: 上传原始文件名文件作为产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: |
+            # 直接上传目录下所有文件（保留原始文件名，无目录嵌套）
+            ${{ github.event.inputs.download_dir }}/*
+            # 排除目录本身（仅上传文件）
+            !${{ github.event.inputs.download_dir }}/
+          retention-days: ${{ github.event.inputs.retention_days }}
+          if-no-files-found: error  # 无文件时直接报错
+
+      # 可选：清理临时目录（如需保留可删除此步骤）
+      # - name: 清理临时文件
+      #   if: always()
+      #   run: rm -rf ${{ github.event.inputs.download_dir }}
