@@ -92,16 +92,12 @@ jobs:
           echo "✅ 共成功下载 $FILE_COUNT 个文件，文件列表："
           ls -l ${{ github.event.inputs.download_dir }}  # 打印下载的文件信息（方便排查）
 
-      # 步骤5：上传文件（直接按原始文件名，无打包）
+      # 步骤5：上传文件（修复path路径写法，移除注释）
       - name: 上传原始文件名文件作为产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.artifact_name }}
-          path: |
-            # 直接上传目录下所有文件（保留原始文件名，无目录嵌套）
-            ${{ github.event.inputs.download_dir }}/*
-            # 排除目录本身（仅上传文件）
-            !${{ github.event.inputs.download_dir }}/
+          path: ${{ github.event.inputs.download_dir }}/*  # 仅保留纯路径，无注释
           retention-days: ${{ github.event.inputs.retention_days }}
           if-no-files-found: error  # 无文件时直接报错
 
