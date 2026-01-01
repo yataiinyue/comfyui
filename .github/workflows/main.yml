@@ -1,4 +1,4 @@
-name: 下载-PUT上传-删除 流水线（curl -T 格式）
+name: 下载文件并保留原始文件名作为产物
 on:
   workflow_dispatch:
     inputs:
@@ -7,136 +7,105 @@ on:
         required: true
         default: 'https://example.com/file1.txt,https://example.com/file2.zip'
       download_dir:
-        description: '临时下载目录（单文件存储，避免累积）'
+        description: '下载文件的临时目录（所有文件直接放此目录，无嵌套）'
         required: false
-        default: './temp_download'
-      upload_base_url:
-        description: '上传基础URL（对应示例中的 http://127.0.0.1:5000/new-path/）'
+        default: './downloaded_files'
+      artifact_name:
+        description: '上传产物的总名称（下载的多个文件会放在此产物包内）'
         required: true
-        default: 'https://dufs.wangjiahui.org:9443/ComfyUI/'
+        default: 'original-filename-assets'
       retention_days:
-        description: '产物保留天数（仅日志，无文件产物）'
+        description: '产物保留天数'
         required: false
-        default: 1
+        default: 7
 
 jobs:
-  download-put-upload-delete:
+  download-with-original-name:
     runs-on: ubuntu-latest
     steps:
       # 可选：检出仓库（无需关联仓库文件可删除）
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # 步骤1：初始化临时目录（确保干净无残留）
-      - name: 创建并清空临时目录
+      # 步骤1：创建纯净的下载目录（确保无残留文件）
+      - name: 创建并清空下载目录
         run: |
-          rm -rf ${{ github.event.inputs.download_dir }}
+          rm -rf ${{ github.event.inputs.download_dir }}  # 先删除旧目录（防止残留）
           mkdir -p ${{ github.event.inputs.download_dir }}
           chmod 755 ${{ github.event.inputs.download_dir }}
 
-      # 步骤2：安装依赖（wget + curl）
-      - name: 安装wget和curl
+      # 步骤2：确保wget可用
+      - name: 安装/验证wget
         run: |
-          sudo apt update && sudo apt install -y wget curl
+          if ! command -v wget &> /dev/null; then
+            sudo apt update && sudo apt install -y wget
+          fi
 
-      # 步骤3：核心流水线：下载→PUT上传→删除（单文件原子化）
-      - name: 下载-PUT上传-删除 循环执行
+      # 步骤3：下载文件（强制保留原始文件名，自动处理URL重定向）
+      - name: 下载文件并保留原始名称
         run: |
-          # 拆分URL列表并初始化变量
+          # 拆分逗号分隔的URL列表，去除首尾空格
           IFS=',' read -ra URL_LIST <<< "${{ github.event.inputs.download_url }}"
-          UPLOAD_BASE="${{ github.event.inputs.upload_base_url }}"
-          TEMP_DIR="${{ github.event.inputs.download_dir }}"
-
-          # 遍历每个URL执行流水线
+          
+          # 遍历每个URL执行下载
           for url in "${URL_LIST[@]}"; do
+            # 清理URL前后空格
             url_trimmed=$(echo "$url" | xargs)
             if [ -z "$url_trimmed" ]; then
               echo "⚠️ 跳过空URL"
               continue
             fi
 
-            echo "====================================="
-            echo "开始处理URL: $url_trimmed"
-            echo "====================================="
-
-            # --------------------------
-            # 子步骤1：下载文件（保留原始文件名）
-            # --------------------------
-            echo "📥 开始下载文件..."
-            # 先获取原始文件名（避免临时文件命名丢失）
-            original_filename=$(basename "$(wget --server-response --spider --content-disposition "$url_trimmed" 2>&1 | grep -oP 'filename="\K[^"]+' || basename "$url_trimmed")")
-            original_filename=$(echo "$original_filename" | xargs)  # 清理空格
-            local_file_path="$TEMP_DIR/$original_filename"  # 临时文件路径（带原始文件名）
-
-            # 下载文件到临时路径（强制保留原始文件名）
-            wget -O "$local_file_path" \
+            echo "📥 开始下载: $url_trimmed"
+            
+            # wget核心参数说明：
+            # -P：下载目录
+            # -c：断点续传
+            # -T 60：超时60秒
+            # -nv：精简输出
+            # --no-check-certificate：忽略证书错误
+            # --content-disposition：关键！强制使用服务器返回的原始文件名（处理重定向/动态URL）
+            # --trust-server-names：使用URL最后部分作为文件名（备用方案）
+            wget -P ${{ github.event.inputs.download_dir }} \
                  -c -T 60 -nv \
                  --no-check-certificate \
+                 --content-disposition \
+                 --trust-server-names \
                  "$url_trimmed"
             
             # 检查下载结果
-            if [ $? -ne 0 ] || [ ! -f "$local_file_path" ]; then
+            if [ $? -ne 0 ]; then
               echo "❌ 下载失败: $url_trimmed"
-              rm -f "$local_file_path"  # 清理临时文件
               exit 1
             fi
-            echo "✅ 下载成功，原始文件名: $original_filename，临时路径: $local_file_path"
-
-            # --------------------------
-            # 子步骤2：PUT上传（严格匹配 curl -T 格式）
-            # 格式：curl -T 本地文件路径 上传目标URL（基础URL+原始文件名）
-            # 示例：curl -T ./temp/file.txt https://dufs.wangjiahui.org:9443/ComfyUI/file.txt
-            # --------------------------
-            echo "📤 开始PUT上传（curl -T 格式）..."
-            upload_target_url="$UPLOAD_BASE$original_filename"  # 拼接最终上传URL
-            echo "上传命令：curl -T $local_file_path $upload_target_url"
-
-            # curl PUT 核心参数：
-            # -T：PUT上传（指定本地文件）
-            # -k：忽略自签名SSL证书错误（你的目标地址是HTTPS）
-            # -L：跟随重定向
-            # -w "%{http_code}"：输出HTTP状态码（用于判断成功）
-            # -o /dev/null：静默输出（仅保留状态码）
-            # --connect-timeout 30：连接超时30秒
-            # --max-time 300：上传超时5分钟
-            upload_http_code=$(curl -T "$local_file_path" \
-                                    "$upload_target_url" \
-                                    -k -L \
-                                    --connect-timeout 30 \
-                                    --max-time 300 \
-                                    -w "%{http_code}" \
-                                    -o /dev/null)
-
-            # 检查上传结果（200/201/204 为常见成功状态码，可根据目标服务调整）
-            if [[ "$upload_http_code" =~ ^20[0-4]$ ]]; then
-              echo "✅ PUT上传成功，HTTP状态码: $upload_http_code"
-            else
-              echo "❌ PUT上传失败，HTTP状态码: $upload_http_code"
-              rm -f "$local_file_path"  # 清理临时文件
-              exit 1
-            fi
-
-            # --------------------------
-            # 子步骤3：删除临时文件（关键：释放磁盘空间）
-            # --------------------------
-            echo "🗑️ 开始删除临时文件..."
-            rm -f "$local_file_path"
-            if [ -f "$local_file_path" ]; then
-              echo "⚠️ 临时文件删除失败: $local_file_path"
-              exit 1
-            else
-              echo "✅ 临时文件已成功删除，磁盘空间释放完成"
-            fi
-
-            echo "====================================="
-            echo "URL处理完成: $url_trimmed"
-            echo "====================================="
-            echo ""
+            echo "✅ 下载成功: $url_trimmed"
           done
 
-      # 步骤4：最终清理临时目录（兜底，确保无残留）
-      - name: 最终清理临时目录
-        if: always()
+      # 步骤4：验证下载结果（防止空产物）
+      - name: 检查下载文件数量
         run: |
-          rm -rf ${{ github.event.inputs.download_dir }}
-          echo "✅ 临时目录已彻底清理"
+          FILE_COUNT=$(find ${{ github.event.inputs.download_dir }} -type f | wc -l)
+          if [ $FILE_COUNT -eq 0 ]; then
+            echo "❌ 下载目录为空，无文件可上传"
+            exit 1
+          fi
+          echo "✅ 共成功下载 $FILE_COUNT 个文件，文件列表："
+          ls -l ${{ github.event.inputs.download_dir }}  # 打印下载的文件信息（方便排查）
+
+      # 步骤5：上传文件（直接按原始文件名，无打包）
+      - name: 上传原始文件名文件作为产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: |
+            # 直接上传目录下所有文件（保留原始文件名，无目录嵌套）
+            ${{ github.event.inputs.download_dir }}/*
+            # 排除目录本身（仅上传文件）
+            !${{ github.event.inputs.download_dir }}/
+          retention-days: ${{ github.event.inputs.retention_days }}
+          if-no-files-found: error  # 无文件时直接报错
+
+      # 可选：清理临时目录（如需保留可删除此步骤）
+      # - name: 清理临时文件
+      #   if: always()
+      #   run: rm -rf ${{ github.event.inputs.download_dir }}
